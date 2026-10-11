@@ -449,7 +449,7 @@ resource "aws_cloudwatch_metric_alarm" "files_waiting_too_long" {
   statistic           = "Maximum"
   period              = 300
   evaluation_periods  = 1
-  threshold           = 900
+  threshold           = 600
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
   alarm_actions       = [aws_sns_topic.notifications.arn]
