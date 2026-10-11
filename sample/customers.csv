@@ -1,0 +1,6 @@
+id,name,email,amount
+1,Ada Lovelace,ada@example.com,120.50
+2,Alan Turing,alan@example.com,75
+3,,grace@example.com,10
+4,Linus Torvalds,linus-at-example.com,30
+5,Margaret Hamilton,margaret@example.com,abc

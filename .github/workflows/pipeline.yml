@@ -1,0 +1,128 @@
+# Change control, the way Best Egg is heading:
+#
+#   Pull request  -> tests + security scan + terraform plan (read-only role)
+#                    -> the plan is posted on the PR for review
+#   Merge to main -> tests + security scan again
+#                    -> waits for a human to approve the "production" environment
+#                    -> terraform apply (only this job can use the apply role)
+#
+# No AWS keys are stored in GitHub. Both jobs get short-lived credentials via OIDC.
+#
+# Settings > Secrets and variables > Actions:
+#   Variables: STATE_BUCKET, PLAN_ROLE_ARN, APPLY_ROLE_ARN
+#   Secret:    NOTIFY_EMAIL (a secret, so it stays hidden in the public logs)
+
+name: pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.16.5"
+  CHECKOV_VERSION: "3.3.26"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -r lambda/requirements-dev.txt
+      - run: pytest -q lambda
+
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Formatting
+        run: terraform fmt -check -recursive
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Security scan (Checkov)
+        run: |
+          pip install "checkov==${CHECKOV_VERSION}"
+          checkov --directory infra --framework terraform --quiet --compact
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: [test, scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # lets the job ask AWS for short-lived credentials
+      pull-requests: write  # lets the job comment the plan on the PR
+    env:
+      TF_VAR_notify_email: ${{ secrets.NOTIFY_EMAIL }}
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.STATE_BUCKET }}"
+      - run: terraform validate
+      - run: terraform plan -input=false -no-color -out=tfplan
+      - run: terraform show -no-color tfplan > plan.txt
+      - name: Post the plan on the pull request
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync('infra/plan.txt', 'utf8');
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n... (cut short)';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '### Terraform plan\n```\n' + plan + '\n```',
+            });
+
+  apply:
+    if: github.event_name == 'push'
+    needs: [test, scan]
+    runs-on: ubuntu-latest
+    # The "production" environment requires a reviewer to approve before this runs,
+    # and the apply role only trusts jobs running in this environment.
+    environment: production
+    concurrency: production  # never two applies at the same time
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_notify_email: ${{ secrets.NOTIFY_EMAIL }}
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.STATE_BUCKET }}"
+      - run: terraform apply -input=false -auto-approve
